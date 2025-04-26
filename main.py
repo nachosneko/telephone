@@ -2,8 +2,11 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 import random
-
 from datetime import datetime, timedelta
+import os
+from dotenv import load_dotenv
+
+load_dotenv(".env.secret")
 
 intents = discord.Intents.all()
 intents.message_content = True
@@ -16,15 +19,19 @@ taken_turns = set()
 current_turn = None
 clip_deadline = None
 chain_log = []
-results_channel_id = None  # Stores the channel ID for result announcements
+results_channel_id = None
+current_clip_url = None
+clip_deadline_hours = 6
+
 
 def reset_game():
-    global participants, taken_turns, current_turn, clip_deadline, chain_log
+    global participants, taken_turns, current_turn, clip_deadline, chain_log, current_clip_url
     participants = []
     taken_turns = set()
     current_turn = None
     clip_deadline = None
     chain_log = []
+    current_clip_url = None
 
 class ClipView(discord.ui.View):
     def __init__(self, author, clip_url):
@@ -64,14 +71,18 @@ class ClipButton(discord.ui.Button):
         receiver = self.user
         taken_turns.add(receiver.id)
         current_turn = receiver.id
-        clip_deadline = datetime.utcnow() + timedelta(seconds=15)
-        chain_log.append((self.clip_view.author, receiver, self.clip_url))
+        clip_deadline = datetime.utcnow() + timedelta(hours=clip_deadline_hours)
+
+        # Update the receiver in the last chain_log entry
+        if chain_log and chain_log[-1][1] is None:
+            last_entry = chain_log.pop()
+            chain_log.append((last_entry[0], receiver, last_entry[2], last_entry[3]))
 
         try:
             await receiver.send(
-                f"\U0001F3B5 Hello! You're next in line for the telephone!\n"
-                f"Your clip: {self.clip_url}\n"
-                f"You got 12 hours to make a clip. Use `/send` to pass it on."
+                f"\U0001F3B5 Hello! You're next in line for the telephone.\n"
+                f"Your clip: {self.clip_view.clip_url}\n"
+                f"You got {clip_deadline_hours} hour(s) to make a clip. Use `/send` to pass it on."
             )
             await interaction.response.send_message(
                 f"Clip sent to {receiver.display_name}.", ephemeral=True
@@ -88,10 +99,10 @@ class ClipButton(discord.ui.Button):
         except discord.NotFound:
             print("❗ Tried to edit a message that no longer exists (likely deleted or ephemeral).")
 
-
-@tasks.loop(seconds=5)
+@tasks.loop(seconds=10)
 async def check_deadlines():
     global current_turn, clip_deadline
+
     if current_turn and clip_deadline and datetime.utcnow() > clip_deadline:
         current_user = discord.utils.get(bot.get_all_members(), id=current_turn)
         if current_user:
@@ -100,10 +111,11 @@ async def check_deadlines():
                 next_user = random.choice(available)
                 taken_turns.add(next_user.id)
                 current_turn = next_user.id
-                clip_deadline = datetime.utcnow() + timedelta(seconds=15)
+                clip_deadline = datetime.utcnow() + timedelta(hours=clip_deadline_hours)
                 try:
                     await next_user.send(
-                        "\U0001F3B5 You were automatically chosen to continue the telephone game. Respond using `/send` within 12 hours."
+                        f"\U0001F3B5 Previous person missed the deadline. Hence you were chosen to continue the chain. Respond with `/send` within {clip_deadline_hours} hour(s).\n"
+                        f"Clip: {current_clip_url}"
                     )
                 except:
                     pass
@@ -120,27 +132,48 @@ async def on_ready():
 async def register(interaction: discord.Interaction):
     if interaction.user not in participants:
         participants.append(interaction.user)
-        await interaction.response.send_message("\u2705 You're now registered!", ephemeral=True)
+        await interaction.response.send_message("✅ You're now registered!", ephemeral=True)
     else:
-        await interaction.response.send_message("\u2757 You're already registered.")
+        if interaction.user.id in taken_turns:
+            # Allow re-queue after turn
+            taken_turns.discard(interaction.user.id)
+            await interaction.response.send_message("🔁 You're back in the queue for another turn!", ephemeral=True)
+        else:
+            await interaction.response.send_message("❗ You're already registered and waiting!", ephemeral=True)
+
+
+@bot.tree.command(name="leave", description="Leave the game.")
+async def leave(interaction: discord.Interaction):
+    global participants, taken_turns
+    if interaction.user in participants:
+        participants.remove(interaction.user)
+        taken_turns.discard(interaction.user.id)
+        await interaction.response.send_message("👋 You've been removed from the game.", ephemeral=True)
+    else:
+        await interaction.response.send_message("❗ You weren't registered in the game.", ephemeral=True)
+
 
 @bot.tree.command(name="send", description="Send your clip to the next person.")
 @app_commands.describe(clip="link", artist="artist name")
 async def send(interaction: discord.Interaction, clip: str, artist: str):
-    global current_turn, clip_deadline
+    global current_turn, clip_deadline, current_clip_url
+
     if interaction.user.id != current_turn:
         await interaction.response.send_message("\u2757 It's not your turn yet.", ephemeral=True)
         return
 
-    clip_with_artist = f"{clip} (Artist: {artist})"
-    view = ClipView(interaction.user, clip_with_artist)
+    current_clip_url = clip  # Only clip is forwarded
+    view = ClipView(interaction.user, clip)
 
     if view.no_choices:
-        chain_log.append((interaction.user, interaction.user, clip_with_artist))
+        chain_log.append((interaction.user, interaction.user, clip, artist))
         await send_results(interaction.client.guilds)
         reset_game()
     else:
-        await interaction.response.send_message("Choose who to send the clip to:", view=view, ephemeral=True)
+        chain_log.append((interaction.user, None, clip, artist))  # Save sender; receiver will be filled later
+        await interaction.user.send("Choose who to send the clip to:", view=view)
+        await interaction.response.send_message("✅ Check your DMs to pick the next person!", ephemeral=True)
+
 
 @bot.tree.command(name="start", description="Admin only: start the game with a specific player.")
 @app_commands.describe(player="The player to start the game with.")
@@ -149,20 +182,20 @@ async def start(interaction: discord.Interaction, player: discord.User):
     global current_turn, clip_deadline
 
     if player not in participants:
-        await interaction.response.send_message(f"\u2757 {player.display_name} is not registered for the game.", ephemeral=True)
+        await interaction.response.send_message(f"\u2757 {player.display_name} did not opt in for the game.", ephemeral=True)
         return
 
     if player.id in taken_turns:
-        await interaction.response.send_message(f"\u2757 {player.display_name} has already participated.", ephemeral=True)
+        await interaction.response.send_message(f"\u2757 {player.display_name} has already taken their turn.", ephemeral=True)
         return
 
     taken_turns.add(player.id)
     current_turn = player.id
-    clip_deadline = datetime.utcnow() + timedelta(seconds=15)
+    clip_deadline = datetime.utcnow() + timedelta(hours=clip_deadline_hours)
 
     try:
         await player.send(
-            f"\U0001F3B5 You're first in the chain for the telephone! You've got within 12 hours to send it forward.\n"
+            f"\U0001F3B5 You're first in the chain for the telephone! You've got within {clip_deadline_hours} hour(s) to send it forward.\n"
             f"Use `/send` to pass your clip when you're ready."
         )
         await interaction.response.send_message(f"{player.display_name} was chosen to start the game!", ephemeral=True)
@@ -174,11 +207,11 @@ async def start(interaction: discord.Interaction, player: discord.User):
 async def setchannel(ctx):
     global results_channel_id
     results_channel_id = ctx.channel.id
-    await ctx.send(f"\U0001F4E2")
+    await ctx.send(f"\U0001F4E2 Results channel set!")
 
-@bot.command(name="registered", aliases=["regs"])
+@bot.command(name="registered", aliases=["p"])
 async def registered(ctx):
-    await ctx.send(f"\U0001F465 {len(participants)} players are registered for the telephone game.")
+    await ctx.send(f"\U0001F465 {len(participants)} players are available for the telephone game.")
 
 @bot.command(name="remaining", aliases=["rem","left"])
 async def remaining(ctx):
@@ -205,6 +238,25 @@ async def sync_commands(ctx, scope: str = "global"):
     else:
         await ctx.send("\u2753 Unknown sync scope. Use `global`, `guild`, or `custom`.")
 
+@bot.command(name="deadline")
+@commands.has_permissions(administrator=True)
+async def deadline(ctx, hours: int):
+    global clip_deadline_hours
+    clip_deadline_hours = hours
+    await ctx.send(f"⏳ Deadline updated! New deadline: {hours} hours.")
+
+@bot.command(name="current")
+@commands.has_permissions(administrator=True)
+async def current(ctx):
+    if current_turn:
+        current_user = discord.utils.get(bot.get_all_members(), id=current_turn)
+        if current_user:
+            await ctx.send(f"🎯 Current turn holder: {current_user.display_name}")
+        else:
+            await ctx.send("❗ Couldn't find who currently has the clip.")
+    else:
+        await ctx.send("❗ No one currently holds the clip.")
+
 async def send_results(guilds):
     if not chain_log:
         return
@@ -213,16 +265,17 @@ async def send_results(guilds):
     max_entries_per_page = 10
     pages = [embed.copy() for _ in range((len(chain_log) + max_entries_per_page - 1) // max_entries_per_page)]
 
-    for i, (sender, receiver, clip_url) in enumerate(chain_log, 1):
+    for i, (sender, receiver, clip_url, artist) in enumerate(chain_log, 1):
         page_index = (i - 1) // max_entries_per_page
         pages[page_index].add_field(
             name=f"#{i}: {sender.display_name} \u2794 {receiver.display_name}",
-            value=clip_url, inline=False
+            value=f"Clip: {clip_url}\nArtist: {artist}",
+            inline=False
         )
 
     with open("telephone_results.txt", "w", encoding="utf-8") as f:
-        for i, (sender, receiver, clip_url) in enumerate(chain_log, 1):
-            f.write(f"#{i}: {sender.display_name} \u2794 {receiver.display_name}\n{clip_url}\n\n")
+        for i, (sender, receiver, clip_url, artist) in enumerate(chain_log, 1):
+            f.write(f"#{i}: {sender.display_name} \u2794 {receiver.display_name}\nClip: {clip_url}\nArtist: {artist}\n\n")
 
     for guild in guilds:
         channel = guild.get_channel(results_channel_id)
@@ -232,4 +285,4 @@ async def send_results(guilds):
                 await channel.send(embed=page)
             await channel.send(file=discord.File("telephone_results.txt"))
 
-bot.run('BOT_SECRET_TOKEN')
+bot.run(os.getenv("BOT_TOKEN"))
